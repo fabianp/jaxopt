@@ -22,13 +22,16 @@ from jax import tree_util
 import jax.numpy as jnp
 
 from jaxopt import objective
+from jaxopt import ScipyBoundedLeastSquares
 from jaxopt import ScipyBoundedMinimize
+from jaxopt import ScipyLeastSquares
 from jaxopt import ScipyMinimize
 from jaxopt import ScipyRootFinding
 from jaxopt._src import scipy_wrappers
 from jaxopt._src import test_util
 from jaxopt._src.tree_util import tree_scalar_mul
 
+import numpy as onp
 import scipy as osp
 from sklearn import datasets
 
@@ -382,7 +385,7 @@ class ScipyRootFindingTest(jtu.JaxTestCase):
     jac_idf = jax.jacrev(wrapper)(self.b)
     self.assertArraysAllClose(jac_theo, jac_idf, atol=1e-3)
 
-  @parameterized.product(pytree_type=['tuple', 'dict'])
+  @parameterized.product(pytree_type=['tuple'])
   def test_linalg_inv_pytree(self, pytree_type: str):
     pytree_init, b = self._init_pytree_and_params_fun(pytree_type)
     root = ScipyRootFinding(optimality_fun=self.fun_pytree,
@@ -392,7 +395,7 @@ class ScipyRootFindingTest(jtu.JaxTestCase):
                                      tree_util.tree_leaves(pytree_fit)):
       self.assertArraysAllClose(array_true, array_fit, atol=1e-3)
 
-  @parameterized.product(pytree_type=['tuple', 'dict'])
+  @parameterized.product(pytree_type=['dict'])
   def test_linalg_inv_pytree_idf(self, pytree_type: str):
     pytree_init, b = self._init_pytree_and_params_fun(pytree_type)
     root = ScipyRootFinding(optimality_fun=self.fun_pytree,
@@ -409,6 +412,247 @@ class ScipyRootFindingTest(jtu.JaxTestCase):
       jac_idf = [list(blk_row) for blk_row in jac_idf]
     jac_idf = jnp.block(jac_idf)
     self.assertArraysAllClose(jac_theo, jac_idf, atol=1e-3)
+
+
+class ScipyLeastSquaresTest(jtu.JaxTestCase):
+
+  def setUp(self):
+    super().setUp()
+
+    self.slope = 2.5
+    self.pytree_init = jnp.asarray([0.0, 0.0, 0.0, 0.0])
+    self.pytree_true = jnp.asarray([1.5, -1.5, -0.25, 1.0])
+
+    def model_fun(params, slope, x):
+      """Implements a toy non-linear curve fitting problem on 2D.
+
+        The model is defined as
+          `f(theta; x) = offset + slope * sigmoid(w1 * x1 + w2 * x2 - t0)`
+        where, for the purposes of testing, `theta = (w1, w2, t0, offset)` are
+        treated as the parameters to be fit via least-squares and `slope` as a
+        hyperparameter used to test implicit differentiation.
+
+      Args:
+        params: a pytree containing the parameters (w1, w2, t0, offset) of the
+          model.
+        slope: a float with the slope hyperparameter.
+        x: a np.ndarray<float>[batch, 2] representing the covariates.
+
+      Returns:
+        a np.ndarray<float>[batch] with the model output for each row in x.
+      """
+      params = self._undo_dict_pytree(params)
+      activation = jnp.dot(x, params[:2]) - params[2]
+      return params[3] + slope * jax.nn.sigmoid(activation)
+
+    def fun(params, slope, data):
+      """Computes the residuals of `model_fun` above at `data`."""
+      x, y_true = data
+      return y_true - model_fun(params, slope, x)
+    self.fun = fun
+
+    n_samples = 25
+
+    key = random.PRNGKey(0)
+    x = random.normal(key, [n_samples, 2])
+    y_true = model_fun(self.pytree_true, self.slope, x)
+    self.data = (x, y_true)
+    self.onp_data = tree_util.tree_map(lambda t: onp.asarray(t, onp.float64),
+                                       self.data)
+
+    self.solver_kwargs = {'method': 'trf'}
+
+  @staticmethod
+  def _do_dict_pytree(pytree):
+    return {'p0': pytree[:2], 'p1': pytree[2], 'p2': pytree[3]}
+
+  @staticmethod
+  def _undo_dict_pytree(pytree):
+    # Relies on 'p0' < 'p1' < 'p2'!
+    return jnp.hstack(tree_util.tree_leaves(pytree))
+
+  def _scipy_sol(self, init_params, slope, **kwargs):
+    def scipy_fun(params):
+      x, y_true = self.onp_data
+      activation = onp.dot(x, params[:2]) - params[2]
+      y_pred = params[3] + slope * onp.reciprocal(1.0 + onp.exp(-activation))
+      return y_true - y_pred
+    return osp.optimize.least_squares(scipy_fun, init_params, **kwargs).x
+
+  def _scipy_slope_jac(self, init_params, slope, eps=1e-2, **kwargs):
+    return (self._scipy_sol(init_params, slope + eps, **kwargs) -
+            self._scipy_sol(init_params, slope - eps, **kwargs)) / (2. * eps)
+
+  @parameterized.product(pytree_type=['array', 'dict'],
+                         loss=['linear', 'arctan'],
+                         f_scale=[0.2, 1.0])
+  def test_fwd(self, pytree_type: str, loss: str, f_scale: float):
+    pytree_true, pytree_init = self.pytree_true, self.pytree_init
+    if pytree_type == 'dict':
+      pytree_true = self._do_dict_pytree(pytree_true)
+      pytree_init = self._do_dict_pytree(pytree_init)
+
+    lsq = ScipyLeastSquares(fun=self.fun,
+                            loss=loss,
+                            f_scale=f_scale,
+                            **self.solver_kwargs)
+    pytree_fit, _ = lsq.run(pytree_init, self.slope, self.data)
+    for array_true, array_fit in zip(tree_util.tree_leaves(pytree_true),
+                                     tree_util.tree_leaves(pytree_fit)):
+      self.assertArraysAllClose(array_true, array_fit, atol=1e-3)
+
+  @parameterized.product(pytree_type=['dict'],
+                         loss=['huber'],
+                         f_scale=[0.2])
+  def test_bwd(self, pytree_type: str, loss: str, f_scale: float):
+    pytree_true = self.pytree_true
+    if pytree_type == 'dict':
+      pytree_true = self._do_dict_pytree(pytree_true)
+
+    lsq = ScipyLeastSquares(fun=self.fun,
+                            loss=loss,
+                            f_scale=f_scale,
+                            implicit_diff=True,
+                            **self.solver_kwargs)
+    def wrapper(slope):
+      return lsq.run(pytree_true, slope, self.data).params
+
+    jac_num = self._scipy_slope_jac(self.pytree_true, self.slope,
+                                    **{'loss': loss, 'f_scale': f_scale})
+    if pytree_type == 'dict':
+      jac_num = self._do_dict_pytree(jac_num)
+    jac_custom = jax.jacrev(wrapper)(self.slope)
+    for array_num, array_custom in zip(tree_util.tree_leaves(jac_num),
+                                       tree_util.tree_leaves(jac_custom)):
+      self.assertArraysAllClose(array_num, array_custom, atol=1e-3)
+
+
+class ScipyBoundedLeastSquaresTest(ScipyLeastSquaresTest):
+
+  def setUp(self):
+    super().setUp()
+
+    pytree_lb = jnp.asarray([-1.0, -1.0, -1.0, -1.0])
+    pytree_ub = jnp.asarray([+1.0, +1.0, +1.0, +1.0])
+    self.pytree_bounds = (pytree_lb, pytree_ub)
+
+  def _scipy_box_sol(self, init_params, box_len, **kwargs):
+    if 'bounds' not in kwargs:
+      kwargs['bounds'] = self.pytree_bounds
+    kwargs['bounds'] = (box_len * kwargs['bounds'][0],
+                        box_len * kwargs['bounds'][1])
+    return self._scipy_sol(init_params, self.slope, **kwargs)
+
+  def _scipy_box_jac(self, init_params, box_len, eps=1e-2, **kwargs):
+    return (
+        self._scipy_box_sol(init_params, box_len + eps, **kwargs) -
+        self._scipy_box_sol(init_params, box_len - eps, **kwargs)) / (2. * eps)
+
+  @parameterized.product(pytree_type=['array', 'dict'],
+                         loss=['linear', 'cauchy'],
+                         f_scale=[1.0])
+  def test_fwd(self, pytree_type: str, loss: str, f_scale: float):
+    pytree_init = self.pytree_init
+    pytree_bounds = self.pytree_bounds
+    if pytree_type == 'dict':
+      pytree_init = self._do_dict_pytree(pytree_init)
+      pytree_bounds = (self._do_dict_pytree(pytree_bounds[0]),
+                       self._do_dict_pytree(pytree_bounds[1]))
+
+    lsq = ScipyBoundedLeastSquares(fun=self.fun,
+                                   loss=loss,
+                                   f_scale=f_scale,
+                                   **self.solver_kwargs)
+    pytree_fit, _ = lsq.run(pytree_init, pytree_bounds, self.slope, self.data)
+
+    # Checks box constraints.
+    for array_lb, array_fit, array_ub in zip(
+        tree_util.tree_leaves(pytree_bounds[0]),
+        tree_util.tree_leaves(pytree_fit),
+        tree_util.tree_leaves(pytree_bounds[1])):
+      self.assertTrue(jnp.all(array_lb <= array_fit).item())
+      self.assertTrue(jnp.all(array_fit <= array_ub).item())
+
+    # Compares against SciPy.
+    pytree_osp = self._scipy_sol(
+        self.pytree_init,
+        self.slope,
+        **{'bounds': self.pytree_bounds, 'loss': loss, 'f_scale': f_scale})
+    if pytree_type == 'dict':
+      pytree_osp = self._do_dict_pytree(pytree_osp)
+
+    for array_osp, array_fit in zip(tree_util.tree_leaves(pytree_osp),
+                                    tree_util.tree_leaves(pytree_fit)):
+      self.assertArraysAllClose(array_osp, array_fit, atol=1e-3)
+
+  @parameterized.product(pytree_type=['dict'],
+                         loss=['huber'],
+                         f_scale=[1.0])
+  def test_bwd_slope(self, pytree_type: str, loss: str, f_scale: float):
+    sol_osp = self._scipy_sol(
+        self.pytree_init,
+        self.slope,
+        **{'bounds': self.pytree_bounds, 'loss': loss, 'f_scale': f_scale})
+    pytree_bounds = self.pytree_bounds
+    pytree_osp = sol_osp
+    if pytree_type == 'dict':
+      pytree_bounds = (self._do_dict_pytree(pytree_bounds[0]),
+                       self._do_dict_pytree(pytree_bounds[1]))
+      pytree_osp = self._do_dict_pytree(pytree_osp)
+
+    lsq = ScipyBoundedLeastSquares(fun=self.fun,
+                                   loss=loss,
+                                   f_scale=f_scale,
+                                   implicit_diff=True,
+                                   **self.solver_kwargs)
+    def wrapper(slope):
+      return lsq.run(pytree_osp, pytree_bounds, slope, self.data).params
+
+    jac_num = self._scipy_slope_jac(
+        sol_osp,
+        self.slope,
+        **{'bounds': self.pytree_bounds, 'loss': loss, 'f_scale': f_scale})
+    if pytree_type == 'dict':
+      jac_num = self._do_dict_pytree(jac_num)
+    jac_custom = jax.jacrev(wrapper)(self.slope)
+    for array_num, array_custom in zip(tree_util.tree_leaves(jac_num),
+                                       tree_util.tree_leaves(jac_custom)):
+      self.assertArraysAllClose(array_num, array_custom, atol=1e-2)
+
+  @parameterized.product(pytree_type=['array'],
+                         loss=['soft_l1'],
+                         f_scale=[0.2])
+  def test_bwd_box_len(self, pytree_type: str, loss: str, f_scale: float):
+    pytree_init = self.pytree_init
+    pytree_bounds = self.pytree_bounds
+    if pytree_type == 'dict':
+      pytree_init = self._do_dict_pytree(pytree_init)
+      pytree_bounds = (self._do_dict_pytree(pytree_bounds[0]),
+                       self._do_dict_pytree(pytree_bounds[1]))
+
+    lsq = ScipyBoundedLeastSquares(fun=self.fun,
+                                   loss=loss,
+                                   f_scale=f_scale,
+                                   implicit_diff=True,
+                                   **self.solver_kwargs)
+    # NOTE: cannot use solution as init since changing box_len might make the
+    # init infeasible.
+    def wrapper(box_len):
+      scaled_bounds = (tree_scalar_mul(box_len, pytree_bounds[0]),
+                       tree_scalar_mul(box_len, pytree_bounds[1]))
+      return lsq.run(pytree_init, scaled_bounds, self.slope, self.data).params
+
+    box_len = 1.0
+    jac_num = self._scipy_box_jac(
+        self.pytree_init,
+        box_len,
+        **{'bounds': self.pytree_bounds, 'loss': loss, 'f_scale': f_scale})
+    if pytree_type == 'dict':
+      jac_num = self._do_dict_pytree(jac_num)
+    jac_custom = jax.jacrev(wrapper)(box_len)
+    for array_num, array_custom in zip(tree_util.tree_leaves(jac_num),
+                                       tree_util.tree_leaves(jac_custom)):
+      self.assertArraysAllClose(array_num, array_custom, atol=1e-2)
 
 
 if __name__ == '__main__':
