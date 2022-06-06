@@ -1,6 +1,7 @@
 Changelog
 =========
 
+
 Development version
 ___________________
 
@@ -9,10 +10,14 @@ Bug fixes and enhancements
 
 - Add support for quadratic polynomial `fun` in :class:`jaxopt.BoxOSQP` and :class:`jaxopt.OSQP`.
 
+- Added example :doc:`/notebooks/deep_learning/maml` by Fabian Pedregosa and Paul Vicol.
+
+
 Contributors
 ~~~~~~~~~~~~
 
-Louis Béthune.
+Louis Béthune, Fabian Pedregosa.
+
 
 Version 0.4.2
 -------------
