@@ -392,7 +392,7 @@ Examples
 
 - :ref:`sphx_glr_auto_examples_constrained_binary_kernel_svm_with_intercept.py`
 - :ref:`sphx_glr_auto_examples_deep_learning_flax_image_classif.py`
-- :ref:`sphx_glr_auto_examples_deep_learning_haiku_image_classif.py`
+- Image Classification with Haiku and JAXopt
 - :ref:`sphx_glr_auto_examples_deep_learning_haiku_vae.py`
 - :ref:`sphx_glr_auto_examples_implicit_diff_lasso_implicit_diff.py`
 - :ref:`sphx_glr_auto_examples_constrained_multiclass_linear_svm.py`
