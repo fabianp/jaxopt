@@ -49,7 +49,19 @@ class PolyakSGDState(NamedTuple):
 
 @dataclasses.dataclass(eq=False)
 class PolyakSGD(base.StochasticSolver):
-  """SGD with Polyak step size.
+  r"""SGD with Polyak step size.
+
+  For the ``SPS_max`` variant, the update is given by
+
+  .. math::
+
+    x^+ = x - \nabla \text{fun}(x)
+  
+  while for the ``SPS+`` variant, it is given by
+
+  .. math::
+
+    x_{t+1} = x_t - \frac{}{} g_t
 
   This solver computes step sizes in an adaptive manner. If the computed step
   size at a given iteration is smaller than ``max_stepsize``, it is accepted.
@@ -57,7 +69,7 @@ class PolyakSGD(base.StochasticSolver):
   take over-confident steps. This is why ``max_stepsize`` is the most important
   hyper-parameter.
 
-  This implementation assumes that the interpolation property holds:
+  This implementation assumes knowledge of a lower bound 
     the global optimum over D must also be a global optimum for any finite sample of D
   This is typically achieved by overparametrized models (e.g neural networks)
   in classification tasks with separable classes, or on regression tasks without noise.
@@ -66,6 +78,8 @@ class PolyakSGD(base.StochasticSolver):
     fun: a function of the form ``fun(params, *args, **kwargs)``, where
       ``params`` are parameters of the model,
       ``*args`` and ``**kwargs`` are additional arguments.
+    value_and_grad: whether ``fun`` just returns the value (False) or both the
+      value and gradient (True).
     has_aux: whether ``fun`` outputs auxiliary data or not.
       If ``has_aux`` is False, ``fun`` is expected to be
         scalar-valued.
@@ -77,8 +91,11 @@ class PolyakSGD(base.StochasticSolver):
       ``(value, aux), grad = fun(...)``.
       At each iteration of the algorithm, the auxiliary outputs are stored
         in ``state.aux``.
+    fun_min: a lower bound on fun.
 
-    max_stepsize: a maximum step size to use.
+    variant: which version of the stochastic Polyak step-size is implemented.
+      Can be one of "SPS_max" or "SPS+".
+    max_stepsize: a maximum step size to use. Only used when variant="SPS_max".
     delta: a value to add in the denominator of the update (default: 0).
     momentum: momentum parameter, 0 corresponding to no momentum.
     pre_update: a function to execute before the solver's update.
@@ -98,21 +115,22 @@ class PolyakSGD(base.StochasticSolver):
 
   References:
     Berrada, Leonard and Zisserman, Andrew and Kumar, M Pawan.
-    "Training neural networks for and by interpolation".
+    `"Training neural networks for and by interpolation" <https://arxiv.org/abs/1906.05661>`_.
     International Conference on Machine Learning, 2020.
-    https://arxiv.org/abs/1906.05661
+    
 
     Loizou, Nicolas and Vaswani, Sharan and Laradji, Issam Hadj and
     Lacoste-Julien, Simon.
-    "Stochastic polyak step-size for sgd: An adaptive learning rate for fast
-    convergence".
+    `"Stochastic polyak step-size for sgd: An adaptive learning rate for fast
+    convergence" <https://arxiv.org/abs/2002.10542>`_.
     International Conference on Artificial Intelligence and Statistics, 2021.
-    https://arxiv.org/abs/2002.10542
   """
   fun: Callable
   value_and_grad: bool = False
   has_aux: bool = False
+  fun_min: float = 0.0
 
+  variant: str = "SPS_max"
   max_stepsize: float = 1.0
   delta: float = 0.0
   momentum: float = 0.0
@@ -182,8 +200,20 @@ class PolyakSGD(base.StochasticSolver):
     (value, aux), grad = self._value_and_grad_fun(params, *args, **kwargs)
 
     grad_sqnorm = tree_l2_norm(grad, squared=True)
-    stepsize = jnp.minimum(value / (grad_sqnorm + self.delta),
-                           self.max_stepsize)
+    if self.variant == "SPS_max":
+      stepsize = jnp.minimum(
+          value / (grad_sqnorm + self.delta), self.max_stepsize
+      )
+    elif self.variant == "SPS+":
+      # if grad_sqnorm is smaller than machine epsilon, we set the stepsize to 0
+      stepsize = jnp.where(grad_sqnorm <= jnp.finfo(dtype).eps, 0., jnp.maximum(value / grad_sqnorm, 0))
+      # if grad_sqnorm <= jnp.finfo(dtype).eps:
+      #   stepsize = 0.
+      # else:
+      #   stepsize = 
+    else:
+      raise NotImplementedError(f"Unknown variant {self.variant}")
+
     stepsize = stepsize.astype(state.stepsize.dtype)
 
     if self.momentum == 0:
@@ -218,9 +248,12 @@ class PolyakSGD(base.StochasticSolver):
   def __post_init__(self):
     super().__post_init__()
 
-    self._fun, self._grad_fun, self._value_and_grad_fun = \
-      base._make_funs_with_aux(fun=self.fun,
-                               value_and_grad=self.value_and_grad,
-                               has_aux=self.has_aux)
+    self._fun, self._grad_fun, self._value_and_grad_fun = (
+        base._make_funs_with_aux(
+            fun=self.fun,
+            value_and_grad=self.value_and_grad,
+            has_aux=self.has_aux,
+        )
+    )
 
     self.reference_signature = self.fun

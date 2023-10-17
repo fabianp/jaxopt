@@ -28,6 +28,28 @@ from sklearn import datasets
 
 class PolyakSgdTest(test_util.JaxoptTestCase):
 
+  @parameterized.product(momentum=[0.0, 0.9], SPS_variant=['SPS+'])
+  def test_logreg_overparameterized(self, momentum, SPS_variant):
+    data = datasets.make_classification(n_samples=10, n_features=20, n_classes=3,
+                                        n_informative=3, random_state=0)
+    # fun(params, data)
+    fun = objective.l2_multiclass_logreg_with_intercept
+    n_classes = len(jnp.unique(data[1]))
+
+    W_init = jnp.zeros((data[0].shape[1], n_classes))
+    b_init = jnp.zeros(n_classes)
+    params = (W_init, b_init)
+
+    opt = PolyakSGD(fun=fun, variant=SPS_variant, maxiter=1000)
+
+    state = opt.init_state(params, l2reg=0., data=data)
+    opt.run(params, l2reg=0., data=data)
+
+    # Check optimality conditions.
+    error = opt.l2_optimality_error(params, l2reg=0., data=data)
+    self.assertLessEqual(error, 0.05)
+
+
   @parameterized.product(momentum=[0.0, 0.9])
   def test_logreg_with_intercept_manual_loop(self, momentum):
     X, y = datasets.make_classification(n_samples=10, n_features=5, n_classes=3,
